@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<title>Zemidjan Routing — Carte interactive Cotonou</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; font-family: system-ui, -apple-system, sans-serif; }
+  #map { position: absolute; top: 0; bottom: 0; left: 0; right: 0; background: #dce7ec; }
+  #panel {
+    position: absolute; z-index: 1000; top: 12px; left: 12px;
+    background: rgba(255,255,255,0.97); padding: 16px 18px; border-radius: 12px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.18); width: 300px;
+  }
+  #panel h1 { font-size: 15px; margin: 0 0 2px; color: #1A1F1D; }
+  #panel .subtitle { font-size: 11px; color: #8a8f8c; margin-bottom: 12px; }
+  #panel .row { margin-bottom: 12px; }
+  #panel label { font-size: 12px; color: #555; display: block; margin-bottom: 4px; font-weight: 500; }
+  #roundLabel { font-weight: bold; color: #1B8A5A; }
+  #blockedBanner {
+    background: #E0A100; color: #fff; font-size: 12px; font-weight: bold;
+    padding: 5px 8px; border-radius: 6px; text-align: center; margin-bottom: 10px; display: none;
+  }
+  .scenario-toggle { display: flex; gap: 6px; }
+  .scenario-toggle button {
+    flex: 1; padding: 7px 0; border: 1.5px solid #1B8A5A; background: #fff; color: #1B8A5A;
+    border-radius: 7px; cursor: pointer; font-size: 12px; font-weight: 500; transition: all 0.15s;
+  }
+  .scenario-toggle button.active { background: #1B8A5A; color: #fff; }
+  .scenario-toggle button:hover:not(.active) { background: #eef7f2; }
+  input[type=range] { accent-color: #1B8A5A; width: 100%; }
+  #playBtn {
+    width: 100%; padding: 8px 0; border: none; border-radius: 7px;
+    background: #2E7DD1; color: #fff; font-size: 13px; cursor: pointer; font-weight: 500;
+  }
+  #playBtn:hover { background: #276bb5; }
+  #stats {
+    font-size: 12px; color: #333; margin-top: 12px; line-height: 1.7;
+    border-top: 1px solid #eee; padding-top: 10px;
+  }
+  #stats b { color: #1A1F1D; }
+  #roadStatus {
+    font-size: 10.5px; color: #8a8f8c; margin-top: 10px; display: flex; align-items: center; gap: 5px;
+  }
+  #roadStatus .dot {
+    width: 6px; height: 6px; border-radius: 50%; background: #E0A100; flex-shrink: 0;
+  }
+  #roadStatus.done .dot { background: #1B8A5A; }
+  #legend {
+    position: absolute; z-index: 1000; bottom: 20px; left: 12px;
+    background: rgba(255,255,255,0.97); padding: 10px 14px; border-radius: 10px;
+    font-size: 11.5px; box-shadow: 0 2px 10px rgba(0,0,0,0.15); color: #333;
+  }
+  #legend .item { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+  #legend span.swatch { display: inline-block; width: 18px; height: 4px; border-radius: 2px; }
+  #legend .veh { width: 9px; height: 9px; border-radius: 50%; background: #ff7f0e; border: 1.5px solid #fff; }
+  .leaflet-tooltip.node-tooltip { font-size: 11px; font-weight: 500; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="panel">
+  <h1>🏍️ Zemidjan Routing</h1>
+  <div class="subtitle">Cotonou — routage adaptatif face aux embouteillages</div>
+  <div id="blockedBanner">🚧 Pont bloqué (accident)</div>
+
+  <div class="row">
+    <label>Stratégie de routage</label>
+    <div class="scenario-toggle">
+      <button id="btnStatic">Statique</button>
+      <button id="btnAdaptive" class="active">Adaptatif</button>
+    </div>
+  </div>
+
+  <div class="row">
+    <label>Round : <span id="roundLabel">1</span> / <span id="roundMax">40</span></label>
+    <input type="range" id="roundSlider" min="1" max="40" value="1" />
+  </div>
+
+  <button id="playBtn">▶ Lecture automatique</button>
+
+  <div id="stats">Chargement des données…</div>
+  <div id="roadStatus"><span class="dot"></span><span id="roadStatusText">Tracé des routes en ligne droite (provisoire)</span></div>
+</div>
+
+<div id="legend">
+  <div class="item"><span class="swatch" style="background:#1a9850"></span>Fluide</div>
+  <div class="item"><span class="swatch" style="background:#fee08b"></span>Chargé</div>
+  <div class="item"><span class="swatch" style="background:#d73027"></span>Saturé / embouteillé</div>
+  <div class="item"><span class="veh"></span>Trajet en cours</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map', { zoomControl: false }).setView([6.375, 2.41], 12.3);
+L.control.zoom({ position: 'topright' }).addTo(map);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors &middot; itinéraires via OSRM',
+  maxZoom: 18,
+}).addTo(map);
+
+let DATA = null;
+let currentRound = 1;
+let currentScenario = 'adaptive';
+let playing = false;
+let playTimer = null;
+const edgeLayers = {};   // "u|v" -> { line, capacity, isBridge }
+const vehicleMarkers = [];
+let vehicleAnimHandle = null;
+let animGeneration = 0;
+
+function edgeKey(u, v) { return [u, v].sort().join('|'); }
+
+function congestionColor(ratio) {
+  const r = Math.max(0, Math.min(1, ratio));
+  const stops = [
+    [0.0, [26, 152, 80]],
+    [0.5, [254, 224, 139]],
+    [1.0, [215, 48, 39]],
+  ];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const [p0, c0] = stops[i], [p1, c1] = stops[i + 1];
+    if (r >= p0 && r <= p1) {
+      const t = (r - p0) / (p1 - p0);
+      const c = c0.map((v, idx) => Math.round(v + t * (c1[idx] - v)));
+      return `rgb(${c[0]},${c[1]},${c[2]})`;
+    }
+  }
+  return 'rgb(215,48,39)';
+}
+
+// --- Tracés routiers réels (OSRM, appelé depuis le navigateur) ---
+// Le serveur de démo public OSRM n'est pas fait pour un usage en
+// production (pas de garantie de disponibilité/débit), mais convient très
+// bien pour cette démo. Les requêtes sont faites une par une (pas en
+// parallèle) par courtoisie envers ce service gratuit. En cas d'échec sur
+// un axe, on garde simplement la ligne droite pour cet axe-là.
+const ROUTING_API = 'https://router.project-osrm.org/route/v1/driving';
+const roadCache = new Map();
+
+async function fetchRoadGeometry(posU, posV) {
+  const coordsStr = `${posU.lon},${posU.lat};${posV.lon},${posV.lat}`;
+  const res = await fetch(`${ROUTING_API}/${coordsStr}?overview=full&geometries=geojson`);
+  if (!res.ok) throw new Error(`OSRM HTTP ${res.status}`);
+  const data = await res.json();
+  const coords = data.routes && data.routes[0] && data.routes[0].geometry.coordinates;
+  if (!coords || coords.length < 2) throw new Error('Pas de tracé retourné');
+  return coords.map(([lon, lat]) => [lat, lon]);
+}
+
+async function loadRealRoads() {
+  const statusEl = document.getElementById('roadStatus');
+  const statusText = document.getElementById('roadStatusText');
+  let done = 0;
+  const total = DATA.edges.length;
+
+  for (const edge of DATA.edges) {
+    const key = edgeKey(edge.u, edge.v);
+    const entry = edgeLayers[key];
+    const posU = DATA.nodes[edge.u], posV = DATA.nodes[edge.v];
+    try {
+      const latlngs = await fetchRoadGeometry(posU, posV);
+      entry.line.setLatLngs(latlngs);
+    } catch (e) {
+      console.warn(`Tracé réel indisponible pour ${edge.u} ↔ ${edge.v}, ligne droite conservée.`, e);
+    }
+    done += 1;
+    statusText.textContent = `Chargement des tracés routiers réels… (${done}/${total})`;
+  }
+
+  statusEl.classList.add('done');
+  statusText.textContent = 'Tracés routiers réels chargés (via OSRM)';
+}
+
+function initNetwork() {
+  const bounds = [];
+
+  for (const [name, pos] of Object.entries(DATA.nodes)) {
+    bounds.push([pos.lat, pos.lon]);
+    L.circleMarker([pos.lat, pos.lon], {
+      radius: 5, color: '#fff', weight: 1.5, fillColor: '#1A1F1D', fillOpacity: 1,
+    }).addTo(map).bindTooltip(
+      name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+      { permanent: false, className: 'node-tooltip', direction: 'top' },
+    );
+  }
+  map.fitBounds(bounds, { padding: [40, 40] });
+
+  for (const edge of DATA.edges) {
+    const posU = DATA.nodes[edge.u], posV = DATA.nodes[edge.v];
+    const isBridge = (edge.u === DATA.bridge_edge[0] && edge.v === DATA.bridge_edge[1]) ||
+                      (edge.v === DATA.bridge_edge[0] && edge.u === DATA.bridge_edge[1]);
+    const line = L.polyline(
+      [[posU.lat, posU.lon], [posV.lat, posV.lon]],
+      { color: '#1a9850', weight: isBridge ? 5 : 2.5, opacity: 0.75, lineCap: 'round' },
+    ).addTo(map);
+    if (isBridge) line.bindTooltip('Pont Ganhi ↔ Akpakpa (goulot d\'étranglement)');
+    edgeLayers[edgeKey(edge.u, edge.v)] = { line, capacity: edge.capacity, isBridge };
+  }
+
+  loadRealRoads();
+}
+
+function animatePaths(paths) {
+  const myGeneration = ++animGeneration;
+  vehicleMarkers.forEach(m => map.removeLayer(m));
+  vehicleMarkers.length = 0;
+  if (vehicleAnimHandle) { cancelAnimationFrame(vehicleAnimHandle); vehicleAnimHandle = null; }
+  if (!paths || paths.length === 0) return;
+
+  const sample = paths.slice(0, 12);
+  const runners = sample.map(path => {
+    // Utilise le trace routier reel de chaque troncon si deja charge,
+    // sinon la ligne droite -- coherent avec ce qui est affiche sur la carte.
+    const latlngs = [];
+    for (let i = 0; i < path.length - 1; i++) {
+      const key = edgeKey(path[i], path[i + 1]);
+      const entry = edgeLayers[key];
+      const segment = entry ? entry.line.getLatLngs() : [
+        [DATA.nodes[path[i]].lat, DATA.nodes[path[i]].lon],
+        [DATA.nodes[path[i + 1]].lat, DATA.nodes[path[i + 1]].lon],
+      ];
+      const forward = L.latLng(DATA.nodes[path[i]].lat, DATA.nodes[path[i]].lon)
+        .distanceTo(segment[0]) <= L.latLng(DATA.nodes[path[i]].lat, DATA.nodes[path[i]].lon).distanceTo(segment[segment.length - 1]);
+      const ordered = forward ? segment : [...segment].reverse();
+      latlngs.push(...ordered.map(p => [p.lat, p.lng]));
+    }
+
+    const marker = L.circleMarker(latlngs[0] || [0, 0], {
+      radius: 5, color: '#fff', weight: 1.5, fillColor: '#ff7f0e', fillOpacity: 1,
+    }).addTo(map);
+    vehicleMarkers.push(marker);
+    return { latlngs, marker, idx: 0, t: 0 };
+  });
+
+  const POINT_DURATION = 220; // ms entre deux points du trace (plus fin qu'un simple saut de noeud a noeud)
+  let lastTs = null;
+
+  function step(ts) {
+    if (myGeneration !== animGeneration) return;
+    if (lastTs === null) lastTs = ts;
+    const dt = ts - lastTs;
+    lastTs = ts;
+
+    let anyActive = false;
+    for (const r of runners) {
+      if (r.latlngs.length < 2 || r.idx >= r.latlngs.length - 1) continue;
+      anyActive = true;
+      r.t += dt / POINT_DURATION;
+      if (r.t >= 1) {
+        r.t = 0; r.idx += 1;
+        if (r.idx >= r.latlngs.length - 1) { r.marker.setLatLng(r.latlngs[r.latlngs.length - 1]); continue; }
+      }
+      const a = r.latlngs[r.idx], b = r.latlngs[r.idx + 1];
+      r.marker.setLatLng([a[0] + (b[0] - a[0]) * r.t, a[1] + (b[1] - a[1]) * r.t]);
+    }
+    if (anyActive) {
+      vehicleAnimHandle = requestAnimationFrame(step);
+    } else {
+      setTimeout(() => { if (myGeneration === animGeneration) animatePaths(paths); }, 600);
+    }
+  }
+  vehicleAnimHandle = requestAnimationFrame(step);
+}
+
+function renderRound() {
+  const roundData = DATA.rounds[currentRound - 1];
+  const scenarioData = roundData[currentScenario];
+
+  document.getElementById('roundLabel').textContent = currentRound;
+  document.getElementById('blockedBanner').style.display = roundData.blocked ? 'block' : 'none';
+
+  for (const [key, entry] of Object.entries(edgeLayers)) {
+    const flow = scenarioData.flows[key] || 0;
+    const ratio = flow / entry.capacity;
+    entry.line.setStyle({
+      color: congestionColor(ratio),
+      weight: (entry.isBridge ? 5 : 2.5) + Math.min(3, ratio * 3),
+      opacity: 0.75 + Math.min(0.2, ratio * 0.2),
+    });
+  }
+
+  document.getElementById('stats').innerHTML =
+    `Temps de trajet moyen : <b>${scenarioData.avg_time.toFixed(1)} min</b><br/>` +
+    `Trajets affichés ce round : <b>${scenarioData.paths.length}</b>`;
+
+  animatePaths(scenarioData.paths);
+}
+
+function setScenario(scenario) {
+  currentScenario = scenario;
+  document.getElementById('btnStatic').classList.toggle('active', scenario === 'static');
+  document.getElementById('btnAdaptive').classList.toggle('active', scenario === 'adaptive');
+  renderRound();
+}
+
+document.getElementById('btnStatic').onclick = () => setScenario('static');
+document.getElementById('btnAdaptive').onclick = () => setScenario('adaptive');
+
+document.getElementById('roundSlider').oninput = (e) => {
+  currentRound = parseInt(e.target.value, 10);
+  renderRound();
+};
+
+document.getElementById('playBtn').onclick = () => {
+  playing = !playing;
+  document.getElementById('playBtn').textContent = playing ? '⏸ Pause' : '▶ Lecture automatique';
+  if (playing) {
+    playTimer = setInterval(() => {
+      currentRound = currentRound >= DATA.rounds.length ? 1 : currentRound + 1;
+      document.getElementById('roundSlider').value = currentRound;
+      renderRound();
+    }, 1400);
+  } else {
+    clearInterval(playTimer);
+  }
+};
+
+fetch('data.json')
+  .then(r => r.json())
+  .then(data => {
+    DATA = data;
+    document.getElementById('roundMax').textContent = DATA.rounds.length;
+    document.getElementById('roundSlider').max = DATA.rounds.length;
+    initNetwork();
+    renderRound();
+  })
+  .catch(err => {
+    document.getElementById('stats').innerHTML =
+      '<span style="color:#D34C4C">Erreur de chargement de data.json — servez ce dossier via un serveur local ' +
+      '(ex. <code>python3 -m http.server</code>) plutôt que d\'ouvrir le fichier directement.</span>';
+    console.error(err);
+  });
+</script>
+</body>
+</html>
